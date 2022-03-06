@@ -1,0 +1,197 @@
+---
+title: "scMono"
+author: "Xiaoman"
+date: "2/26/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+setwd("/home/BD")
+options(stringsAsFactors = F)
+source("./code/sour_bd.R")
+
+```
+
+```{r}
+mono.bj=readRDS("./data/mono.bj.new.rds")
+setwd("./data/scRNA_seq_data/")
+mono.list<- list()
+filename<- list.dirs("./",recursive = F)
+for (i in filename) {
+  tmp<-Read10X(i)
+  print("finish read10x")
+  tmp.obj<- CreateSeuratObject(counts = tmp, project =basename(i),
+                               min.cells = 5,min.features = 200 )
+  #remove cells with low quality
+  tmp.obj[["percent.mt"]]<- PercentageFeatureSet(tmp.obj,pattern="^MT")
+  
+  tmp.obj<- subset(tmp.obj, 
+                   subset= nFeature_RNA>200 & nFeature_RNA<4000 & 
+                     percent.mt<10 )
+  #normalization
+  tmp.obj <- NormalizeData(tmp.obj)
+  tmp.obj <- FindVariableFeatures(tmp.obj,selection.method = "vst")
+  mono.list[[basename(i)]]<- tmp.obj
+}
+
+mono.bj <- RunPCA(mono.bj)
+mono.bj <- FindNeighbors(mono.bj, dims = 1:20)
+mono.bj <- FindClusters(mono.bj, resolution = 0.9)
+mono.bj <- RunUMAP(mono.bj, dims = 1:20)
+
+cluster.marker.new<- FindAllMarkers(mono.bj,
+                                    only.pos = T,
+                                    min.pct = 0.25, 
+                                    logfc.threshold = 0.2)
+write.csv(cluster.marker.new, 
+          file = "./data_saved/cluster.marker.new.csv")
+```
+
+# Figure 3
+
+```{r}
+library(ggsci)
+
+###plot
+cell.order=c("EIF5A+Mono","VIM+Mono","SOD2+Mono","ISG15+Mono","MHC-II+Mono","MoDC","CD16+Mono","C1Q+Mono" )
+
+
+#91b3d7 A0CBEB a0d4ee b9aa97
+cellcol=c("#4f6980","#849db1","#BEBADA",
+                 "#a2ceaa","#bfbb60",
+                 "#86BCB6","#FF9D9A",'#f47942')
+cellcol=setNames(cellcol,levels(mono.bj$sum.ident))
+colHC<- rgb(60, 84, 136, 130, maxColorValue=255)
+colBD<- rgb(243, 155, 127, 160, maxColorValue=255)
+library(scales)
+show_col(cellcol)
+DimPlot(mono.bj,group.by = "sum.ident",label =T,
+        cols = cellcol) ->p
+ggsave(p, filename = "./Figures/BM_dimplot_new.pdf",width = 7,height = 4.5)
+```
+
+```{r}
+# plot markers
+markers.to.plot.my <- c("CD14" , "EIF5A","C1orf56",
+                        "VIM","GAPDH","MGST1","SOD2","CYBA","NAMPT",
+                        "ISG15","MX1","MX2",
+                        "CD74", "HLA-DRA", "HLA-DQA1","HLA-DPB1",
+                         "CST3","CLEC10A","FCER1A",
+                        "FCGR3A","MS4A7","CX3CR1","C1QA","C1QB","C1QC","CD68") 
+
+DotPlot(mono.bj, features = rev(markers.to.plot.my),group.by = "sum.ident",
+        dot.scale = 5 ) + RotatedAxis()+
+  scale_colour_distiller(palette = "RdYlBu")+rremove("xlab")+rremove("ylab")->p2
+p2
+ggsave(p2, filename = "./Figures/BM_marker_expr2.pdf",height = 5,width = 9.5)
+
+```
+
+
+```{r}
+#do the enrichment for the markers
+
+mono.marker.list = makeMarkers.list(degene = clusters.markers)
+
+up.go<- compareCluster(geneCluster = mono.marker.list,
+                       OrgDb='org.Hs.eg.db',ont="BP",
+                          fun = "enrichGO")
+setReadable(up.go,OrgDb ='org.Hs.eg.db' )->up.go.read
+plot.tmp<-dotplot(up.go,showCategory=30)+rotate_x_text()
+ 
+# plot the up.go result
+up.go.data<- as.data.frame(plot.tmp$data)
+ unique(up.go.data$Description)
+selected.path<- c("neutrophil degranulation","neutrophil activation",
+                  "defense response to fungus","defense response to virus",
+                  "response to oxidative stress","response to reactive oxygen species",
+                  "response to type I interferon","response to interferon-gamma",
+                  "antigen processing and presentation","T cell activation",
+                  "toll-like receptor signaling pathway","phagocytosis"
+                  ) 
+up.go.data= up.go.data[up.go.data$Description%in% selected.path,]
+up.go.data %>%
+  mutate(logPadj = -log10(p.adjust)) %>%
+  mutate(logPadj= if_else(logPadj>25,25,logPadj)) %>%
+  ggscatter(x="Cluster",y="Description",
+            size = "logPadj",color = "logPadj")+
+  #scale_color_viridis(option = "B",direction = -1)+
+  scale_color_distiller(palette = "YlOrRd",direction = 1)+
+  rremove(("xlab"))+rremove(("ylab"))->p
+
+ggsave(plot = p,
+       filename = "./Figures/marker.all.go2.pdf",width = 7.5,height = 5)
+
+```
+
+```{r}
+# plot the cell ratio per patient
+mono.bj@meta.data %>%
+  group_by(Pat) %>%
+  summarise(pat_cell=n()) ->pat.cell
+library(ggpubr)
+mono.bj@meta.data %>%
+  group_by(sum.ident,condition,Pat) %>%
+  summarise(cls_n=n()) %>%
+  inner_join(pat.cell,by=c("Pat"="Pat")) %>%
+  dplyr::mutate(ratio = cls_n/pat_cell)  %>% 
+  ggboxplot(x="condition",y="ratio",fill = "condition",palette = c(colHC,colBD),
+            ylab = "Fraction of total monocytes per patient",alpha=.5,
+            color  = "condition",add = "jitter")+rremove("xlab")+
+  stat_compare_means(aes(group=condition),label = "p.signif",method = "t.test")+
+  facet_wrap(~sum.ident,scales = "free",nrow = 2)->p4
+
+ggsave(p4, height = 5,width = 8,
+       filename = "../loading_data/Figures_BD/revised/mono_per_pat.pdf")
+```
+
+# compare three functions across monocyte subsets
+
+```{r}
+# signature collected from published studies
+sg_file.list= readRDS("./loading_Data/signature_all.rds")
+
+mono.obj.all2 <- AddModuleScore(
+  object = mono.bj,
+  features = sg_file.list[c("GOBP_PHAGOCYTOSIS",
+                            'antigen_presentation','cytokine_customed')]
+  
+)
+
+loc = grepl(colnames(mono.obj.all2@meta.data),pattern="Cluster")
+colnames(mono.obj.all2@meta.data)[loc]=  c("phagocytosis",'antigen_presentation','cytokine')
+score.dc.mono = as.data.frame(mono.obj.all2@meta.data)
+
+p.list=list()
+for (path in c("phagocytosis",'antigen_presentation','cytokine')) {
+  as.data.frame(score.dc.mono[,c('sum.ident',"phagocytosis",'antigen_presentation','cytokine',"condition")])%>%
+  ggviolin(x="sum.ident",
+           fill="sum.ident",
+           add = "boxplot",x.text.angle=90,
+           y=path,xlab = "",
+           add.params = list(fill="white",color="grey40"))+
+  rremove("legend")+stat_compare_means()+
+  stat_compare_means(comparisons = 
+                       list(c("C1Q+Mono", "CD16+Mono")))+
+  scale_fill_manual(values = cellcol)+
+    facet_wrap(~condition,scales = "free")->p.list[[path]]
+}
+
+VlnPlot(subset(mono.obj.all2,condition=="BD"),
+        group.by = "sum.ident",
+        features =c("phagocytosis",'antigen_presentation','cytokine'),
+        pt.size = 0,cols = cellcol)->p
+VlnPlot(subset(mono.obj.all2,condition=="HC"),
+        group.by = "sum.ident",
+        features =c("phagocytosis",'antigen_presentation','cytokine'),
+        pt.size = 0,cols = cellcol)->p2
+
+
+ggsave(plot = plot_grid(p,p2,nrow = 2,
+                        labels = c("BD","HC")),
+       height = 6,width = 9,
+       filename = "../loading_data/Figures_BD/revised//compare_function.pdf")
+```
+
+

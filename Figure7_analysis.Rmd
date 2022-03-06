@@ -1,0 +1,187 @@
+---
+title: "Figure7"
+author: "Xiaoman"
+date: "3/6/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+clusters.markers= readRDS("./data/cluster.marker.new_name.rds")
+top_markers= clusters.markers[clusters.markers$cluster=="C1Q+Mono",]$gene%>% head(n=20)
+
+```
+
+# Test prediction power of C1q monocytes in other cohorts
+
+```{r}
+calcAUC<- function(formula="condition ~top_genes",title="top5",
+                   data = data.pred){
+  library(lme4)
+  library(lmtest)
+
+  mylogit <- glm(formula,data, family = "binomial")
+  prob <- predict(mylogit,type='response')
+  data$prob<- prob
+  g <- roc(data$condition, data$prob, ci = T)
+  print(plot.roc(g,print.auc = TRUE,xlim = c(1,0)))
+  return(g)
+}
+```
+
+## check the AUC in in-house cohort
+
+```{r}
+# bulk rnaseq to calc the score
+bulk.rnq.tpm= read.csv( "./data/bulk.rnq.TPM.csv",row.names = 1)
+as.data.frame(bulk.rnq.tpm) %>%
+  rownames_to_column(var="gene_id")->bulk.rnq.tpm
+
+bulk.rnq.tpm[(bulk.rnq.tpm$gene_id)%in% top_markers,] ->top_tpm
+rownames(top_tpm)= top_tpm$gene_id
+top_tpm=top_tpm[,-1]
+
+as.data.frame(t(top_tpm )) %>%
+   rownames_to_column(var = "ID") %>%
+  mutate(median_val = rowMeans(.[,-1])) %>%
+ 
+  mutate(condition= substr(ID,1,2),
+         condition = if_else(condition=="BD",1,0)) ->data.pred
+colnames(data.pred)=gsub(colnames(data.pred),pattern = "-",replacement = "_")
+
+
+g1<-calcAUC(formula=paste0('condition ~',
+                       paste(top_markers[1:3],collapse = "+")
+                       ),title="in-house cohort",
+                   data = data.pred) 
+
+ggroc(g1,legacy.axes = T)+
+  theme_pubr()+labs(title = "in-house cohort")+
+  annotate("text", x = .25, y = .75, label = "AUC:0.967(0.894-1.00)")+
+  geom_segment(aes(x = 0, xend = 1, y = 0, yend = 1), color="darkgrey", linetype="dashed")->p1
+```
+
+
+## GSE17114 dataset
+
+```{r}
+sample.pub1<- read.csv("./public_data/bulk_rnaseq//GSE17114_sample.csv")
+expr.pub1<- read.csv("./public_data/bulk_rnaseq/GSE17114_expr.csv",
+                     row.names = 1)
+
+sample.pub1 <- sample.pub1 %>%
+  separate(col = "condition",into = c("tissue","condition","id")) 
+
+expr.pub1[rownames(expr.pub1)%in%top_markers,] %>%
+  t() %>%
+  as.data.frame() %>%
+  mutate(condition = sample.pub1$condition,
+         condition = if_else(condition=="BD",1,0),
+         median_val = rowMeans(as.matrix(.[,c(1,4)])))  ->data.test
+colnames(data.test)= gsub(colnames(data.test),pattern = "-",replacement = '_')
+g2<-calcAUC(formula=paste0('condition ~',
+                       paste(top_markers[1:5],collapse = "+")
+                       ),title="GSE17114 cohort",
+                   data = data.test) 
+
+ggroc(g2,legacy.axes = T)+theme_pubr()+
+  labs(title = "GSE17114")+
+  annotate("text", x = .25, y = .75, label = "AUC:0.705(0.506-0.904)")+
+  geom_segment(aes(x = 0, xend = 1, y = 0, yend = 1), color="darkgrey", linetype="dashed")->p2
+
+```
+
+
+## GSE165254 data
+
+```{r}
+GSE165254.tpm = read.csv("GSE165254.TPM.csv",row.names = 1)
+
+GSE165254.tpm[rownames(GSE165254.tpm)%in% top_markers,] %>%
+  t() %>%
+  as.data.frame()  %>%
+  scale(.) %>% as.data.frame() %>%
+  mutate(median_val = rowMedians(as.matrix(.))) %>% 
+  rownames_to_column(var = "sample") %>%
+  mutate(condition = substr(sample,1,2),
+         condition = if_else(condition=="BD",1,0)) -> data.test2
+
+library(lmerTest)
+
+g3<-calcAUC(formula=paste0('condition ~',
+                       paste(top_markers[1:5],collapse = "+")
+                       ),title="GSE165254 cohort",
+                   data = data.test2) 
+
+ggroc(g3,legacy.axes=T)+theme_pubr()+labs(title = "GSE165254")+
+  annotate("text",x=.25,y=.75,label="AUC: 0.857(0.707-1.000)")+
+  geom_segment(aes(x=0,xend=1,y=0,yend=1),color="darkgrey",
+               linetype="dashed")->p3
+
+
+```
+
+## save figures 
+
+```{r}
+library(cowplot)
+
+ggsave(plot_grid(p1,p2,p3,nrow = 1),
+       filename = "./auc_three_cohort.pdf",
+       height = 3,width = 9)
+```
+
+# GWAS analysis
+
+```{r}
+# try the gwas enrichment 
+library(tidyverse)
+library(GSVA)
+library(matrixStats)
+library(pheatmap)
+library(ComplexHeatmap)
+
+expr.mono= read.csv("./loading_data/processed/expr.mono.csv")
+gwas.cata<- fread("./public_data/gwas_catalog_bd.csv")
+gwas.cata %>%
+  separate(col = `Mapped gene`,into=c("gene1","gene2","gene3"),
+           extra = "merge",sep=",") %>% 
+  pull(gene1) %>% unique()->gwas.cata.gene
+gwas.cata.gene= setdiff(gwas.cata.gene,"IL12A")
+# add genes from clivar
+gwas.cata.gene=c("IL12RB2","IL10","FGFR3P1","HORMAD2",
+                 "IL1B","LACC1",gwas.cata.gene)
+gwas.mono = expr.mono[rownames(expr.mono)%in% gwas.cata.gene,]
+gwas.mono = gwas.mono[rowSums(gwas.mono)>0,]
+
+cell.order=c("EIF5A+Mono","VIM+Mono","SOD2+Mono",
+             "ISG15+Mono","MHC-II+Mono","MoDC","CD16+Mono","C1Q+Mono" )
+cellcol=c("#4f6980","#849db1","#BEBADA",
+          "#a2ceaa","#bfbb60",
+          "#86BCB6","#FF9D9A",'#f47942')
+
+colnames(gwas.mono)=cell.order  
+colMedians(as.matrix(gwas.mono))->mean.bd
+setNames(mean.bd,colnames(gwas.mono))->mean.bd
+mean.bd= sort(mean.bd)
+
+
+# plot 
+setNames(brewer.pal("YlOrBr",n=8),nes[names(mean.bd)])->col_fun
+ha = HeatmapAnnotation(col = list(Mean_Expr = cellcol[names(mean.bd)]),
+                       Mean_Expr = anno_points(mean.bd)
+                       )
+library(RColorBrewer)
+gwas.mono.scale = t(scale(t(gwas.mono)))
+
+Heatmap(gwas.mono.scale[,names(mean.bd)], 
+        col=rev(col2(100)),
+        name = "Average Expr", cluster_columns = F,
+        top_annotation = ha)->p
+generate.PDF(p, height = 5.5,width = 6.5,
+             working_path = "./Figures/scRNAseq/",
+             filename = "gwas.bd.pdf")
+```
+
+
+

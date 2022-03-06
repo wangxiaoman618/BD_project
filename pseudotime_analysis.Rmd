@@ -1,0 +1,295 @@
+---
+title: "Pseudotime_analysis"
+author: "Xiaoman"
+date: "2/26/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+setwd("/home/BD/")
+options(stringsAsFactors = F)
+
+suppressPackageStartupMessages({
+  library(slingshot); library(SingleCellExperiment)
+  library(RColorBrewer); library(scales)
+  library(viridis); library(UpSetR)
+  library(pheatmap); library(msigdbr)
+  library(fgsea); library(knitr)
+  library(ggplot2); library(gridExtra)
+  library(Seurat);library(bioc2020trajectories)
+  library(export);library(ggrepel)
+  library(tidyverse);library(tradeSeq)
+  library(ggpubr);library(RColorBrewer)
+  library(clusterProfiler);require(org.Hs.eg.db)
+  require(destiny, quietly = TRUE)
+})
+
+```
+
+
+
+```{r}
+mono.bj=readRDS("./data/mono.bj.new.rds")
+pca <- as.matrix(mono.bj@reductions$pca@cell.embeddings)
+umap <- mono.bj@reductions$umap@cell.embeddings
+dc <- as.matrix(as.data.frame(dm)[,1:20])
+sce <- as.SingleCellExperiment(mono.bj, assay="RNA")
+reducedDims(sce) <- SimpleList(dc=dc,pca=pca,umap=umap)
+sce_dc_cluster <- slingshot(sce, reducedDim = 'dc', clusterLabels = colData(sce)$sum.ident,
+                 start.clus = 'SOD2+Mono',approx_points = 150)
+
+
+```
+
+```{r}
+generate.PDF <- function(filename=filename,plot= plot,
+                         width = 8.5,height = 5) {    
+  pdf(filename, 
+      width=width, height=height,onefile=T)
+  print(plot)
+  dev.off()
+}
+
+mono_col <- c("#4f6980","#849db1", 
+              "#BEBADA", "#a2ceaa", 
+              "#bfbb60", "#86BCB6",
+              "#FF9D9A", "#f47942")
+setNames(mono_col,levels(sce_dc_cluster$sum.ident))->mono_col
+
+```
+
+
+
+# use TSCAN to calculate the pseudotime
+
+```{r}
+library(TSCAN)
+library(scater)
+
+colLabels(sce_dc_cluster)=sce_dc_cluster$sum.ident
+by.cluster <- aggregateAcrossCells(sce_dc_cluster,
+                                   ids=colLabels(sce_dc_cluster))
+centroids <- reducedDim(by.cluster, "pca")
+
+pseudo.all <- quickPseudotime(sce_dc_cluster, use.dimred="pca")
+common.pseudo <- rowMeans(as.matrix(pseudo.all$ordering),
+                          na.rm=TRUE)
+sce_dc_cluster$pt_tscan = common.pseudo
+```
+
+
+#  plot peudotime
+```{r}
+reducedDims(sce_dc_cluster)$dc[,1:2] %>%
+  as.data.frame() %>%
+  mutate(cluster = sce_dc_cluster$sum.ident) %>% 
+  ggscatter(x="DC1",y="DC2",color ="cluster" )+
+  scale_color_manual(values = mono_col)+
+  rremove("legend.title")->p
+ggsave(p, filename = "../Figures/DC_branch.pdf",
+       height = 6,width = 5)
+
+reducedDims(sce_dc_cluster)$dc[,1:2] %>%
+  as.data.frame() %>%
+  mutate(pt = sce_dc_cluster$pt_tscan) %>% 
+  ggscatter(x="DC1",y="DC2",color ="pt" )+
+  scale_color_viridis_c()->p
+  
+ggsave(p, filename = "../Figures/DC_branch_time.pdf",
+       height = 6,width = 5)
+```
+
+
+```{r}
+
+pt.tscan = data.frame(pseudo.all$ordering[,3:4])
+
+pt.tscan %>%
+  mutate(condition = sce_dc_cluster$condition) %>%
+  gather(-condition,key = "lineage",value = "pt") %>% 
+  ggplot(aes(y = pt, 
+           x = lineage, colour = condition)) +
+    geom_quasirandom(groupOnX = T) +
+    scale_color_manual(values = c(colHC,colBD)) +
+    theme_pubr() +
+  scale_x_discrete(labels=c("C1Q.Mono" = "Fate 1", 
+                            "MoDC"="Fate 2"))+
+    ylab("Pseudotime") +
+    rremove("xlab") ->p
+
+ggsave(p, filename = "../Figures/pt_comparision.pdf",
+       height = 6,width = 4)
+
+pt.tscan %>%
+  mutate(condition = sce_dc_cluster$condition)  ->pt.tscan.tmp
+  
+loc = (pt.tscan.tmp$condition=="BD")
+ks.test(pt.tscan.tmp$C1Q.Mono[loc],
+        pt.tscan.tmp$C1Q.Mono[-loc],
+        alternative = "t")
+#7.997e-08
+ks.test(pt.tscan.tmp$MoDC[loc],
+        pt.tscan.tmp$MoDC[-loc],
+        alternative = "t")
+#0.0007541
+
+```
+
+
+
+
+
+# obtain signif genes along moDC and c1q mono path
+
+```{r}
+
+pseudo.dc <- testPseudotime(sce_dc_cluster,
+                    pseudotime=pseudo.all$ordering[,3])
+pseudo.dc$SYMBOL <- rownames(pseudo.dc)
+pseudo.dc[order(pseudo.dc$p.value),]->pseudo.dc
+
+pseudo.c1q <- testPseudotime(sce_dc_cluster,
+                    pseudotime=pseudo.all$ordering[,4])
+pseudo.c1q$SYMBOL <- rownames(pseudo.c1q)
+pseudo.c1q[order(pseudo.c1q$p.value),]->pseudo.c1q
+save(pseudo.c1q,pseudo.dc,pseudo.all, 
+     file = "../output/tscan_pt.RData")
+```
+
+# plot signif genes
+
+```{r}
+rowData(sce_dc_cluster)$SYMBOL=rownames(rowData(sce_dc_cluster))
+
+sce_dc_cluster$TSCAN.dc <- pseudo.all$ordering[,3]
+on.first.path <- !is.na(sce_dc_cluster$TSCAN.dc)
+up.right.dc <- pseudo.dc[pseudo.dc$logFC > 0,]
+up.left.dc <- pseudo.dc[pseudo.dc$logFC < 0,]
+
+up.right.dc <- up.right.dc[order(up.right.dc$logFC,decreasing = T),]
+sel.gene<- head(up.right.dc$SYMBOL, 20)
+
+sel.gene = head(up.right.dc[up.right.dc$logFC>.01,]$SYMBOL, 20)
+
+plotHeatmap(sce_dc_cluster[,on.first.path], order_columns_by="TSCAN.dc", 
+    colour_columns_by="label",
+    color = rev(col2(50)),
+    column_annotation_colors = list(TSCAN.dc =viridis_pal()(200),label = mono_col),
+    features=c(sel.gene[-6],"CLEC10A"),
+    center=TRUE, swap_rownames="SYMBOL")->p
+ggsave(p, filename = "../Figures/pheatmap_dc.pdf",
+       height = 3.5,width = 7)
+
+
+##########
+sce_dc_cluster$TSCAN.c1q <- pseudo.all$ordering[,4]
+on.second.path <- !is.na(sce_dc_cluster$TSCAN.c1q)
+up.right.c1q <- pseudo.c1q[pseudo.c1q$logFC > 0,]
+up.left.c1q <- pseudo.c1q[pseudo.c1q$logFC < 0,]
+
+up.right.c1q <- up.right.c1q[order(up.right.c1q$logFC,decreasing = T),]
+sel.gene<- head(up.right.c1q$SYMBOL, 20)
+library(viridis)
+plotHeatmap(sce_dc_cluster[,on.second.path],
+            order_columns_by="TSCAN.c1q", 
+    colour_columns_by="label",color = rev(col2(50)),
+    column_annotation_colors = list(TSCAN.c1q =viridis_pal()(200),label = mono_col),
+    features=c(sel.gene[-18],"ISG15"),
+    center=TRUE, swap_rownames="SYMBOL")->p
+generate.PDF(p, filename = "../Figures/pheatmap_c1q.pdf",
+             height = 3.5,width = 7)
+
+```
+
+# pathway enrichment for these signficant genes
+
+```{r}
+only.c1q <- pseudo.c1q[which(pseudo.c1q$FDR<0.05&
+                              pseudo.c1q$logFC>.01),]$SYMBOL
+
+#| sign(pseudo.dc$logFC)!=sign(pseudo.c1q$logFC)
+#& (pseudo.dc$p.value >= 0.05 ))
+# no result
+
+only.dc<- pseudo.dc[which(pseudo.dc$FDR<0.05 & 
+    (pseudo.dc$logFC>.01)) ,]$SYMBOL
+
+only.gene = list(dc_unique =setdiff(only.dc,only.c1q),
+                 c1q_unique = setdiff(only.c1q,only.dc) )
+
+lapply(only.gene, function(x){tmp = bitr(x, fromType="SYMBOL", toType="ENTREZID", OrgDb="org.Hs.eg.db");
+return(tmp$ENTREZID)})->only.gene.eg
+
+
+Lineage.kegg <- compareCluster(geneCluster = only.gene.eg,
+                          fun = "enrichKEGG",
+                          organism="hsa")
+Lineage.go <- compareCluster(geneCluster = only.gene.eg,
+                             fun = "enrichGO",
+                        OrgDb='org.Hs.eg.db',ont="BP")
+#plot selected pathways
+plot.tmp<-dotplot(Lineage.kegg,showCategory=30)+rotate_x_text()
+ 
+# plot the up.go result
+up.go.data<- as.data.frame(plot.tmp$data)
+ unique(up.go.data$Description)
+selected.path<- c("RNA transport",
+                  "Protein processing in endoplasmic reticulum",
+                  "Proteasome","Proteasome",
+                  "Oxidative phosphorylation",
+                  "Antigen processing and presentation",
+                  "Epstein-Barr virus infection",
+                  "B cell receptor signaling pathway",
+                  "Complement and coagulation cascades",
+                  "Natural killer cell mediated cytotoxicity",
+                  "T cell activation",
+                  "Chemokine signaling pathway",
+                  "Human immunodeficiency virus 1 infection",
+                  "NOD-like receptor signaling pathway"
+                  ) 
+up.go.data= up.go.data[up.go.data$Description%in% selected.path,]
+up.go.data %>%
+  mutate(logPadj = -log10(p.adjust)) %>%
+  #mutate(logPadj= if_else(logPadj>25,25,logPadj)) %>%
+  ggscatter(x="Cluster",y="Description",
+            size = "GeneRatio",color = "logPadj")+
+  #scale_color_viridis(option = "B",direction = -1)+
+  scale_color_distiller(palette = "Reds",direction = 1)+
+  rremove(("xlab"))+rremove(("ylab"))->p
+
+ggsave(plot = p,
+       filename = "../Figures/KEGG_pt.pdf",
+       width = 6.5,height = 4)
+
+```
+
+# plot TF along fate path
+
+```{r}
+sce_dc_cluster$pt_fate1=pseudo.all$ordering[,4]
+sce_dc_cluster$pt_fate2=pseudo.all$ordering[,3]
+
+plotExpression(sce_dc_cluster,features=c("NR4A1","MAFB"), 
+               swap_rownames="SYMBOL",ncol = 3,
+    x="pt_fate1", colour_by="label",
+    show_smooth = TRUE) +
+  scale_color_manual(values = mono_col)->p1
+ggsave(p1, 
+       filename = "../Figures/selected_gene_fate1_1.pdf",
+       height = 3.5,width = 8)
+#####
+
+plotExpression(sce_dc_cluster,
+               features=c("RHOB","IRF2","IKZF1"), 
+               swap_rownames="SYMBOL",ncol = 3,
+    x="pt_fate2", colour_by="label",
+    show_smooth = TRUE) +
+  scale_color_manual(values = mono_col)->p3
+ggsave(p2, 
+       filename = "../Figures/selected_gene_fate1_2.pdf",
+       height = 3.5,width = 8)
+
+```
+
+

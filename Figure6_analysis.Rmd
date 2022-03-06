@@ -1,0 +1,531 @@
+---
+title: "Figure6_analysis"
+author: "Xiaoman"
+date: "3/6/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(circlize)
+library(SCENIC)
+library(AUCell)
+library(tidyverse)
+library(ggplot2)
+library(ggsci)
+library(ggpubr)
+library(ggbeeswarm)
+
+```
+
+# SCENIC analysis
+
+```{r}
+
+cellInfo<-read.csv('./mono.all.meta.csv',header = T)
+
+# only keep C1Q NCM
+cellInfo2<-cellInfo[which(cellInfo$final_id=='C1Q+NCM'),]
+write.csv(cellInfo2,'cellinfo_C1Q_NCM.csv',quote=F)
+
+cellTypeColumn <- "condition"
+colnames(cellInfo2)[which(colnames(cellInfo2)==cellTypeColumn)] <- "CellType"
+cbind(table(cellInfo2$CellType))
+
+
+#############################
+expr<-read.csv('./exprMat_C1Q_mono.csv',header = T)
+rownames(expr)<-expr$X
+expr$X<-NULL
+
+org="hgnc" # mgi for mouse, hgnc for human, or dmel for fly
+dbs <- defaultDbNames[[org]]
+dbDir="./cisTarget_databases"
+myDatasetTitle="SCENIC analysis of monocyte"
+scenicOptions <- initializeScenic(org=org, 
+                                  dbDir=dbDir, 
+                                  dbs=dbs, 
+                                  datasetTitle=myDatasetTitle)
+scenicOptions@inputDatasetInfo$cellInfo <- "int/cellInfo.Rds"
+scenicOptions@inputDatasetInfo$colVars <- "int/colVars.Rds"
+saveRDS(scenicOptions, file="int/scenicOptions.Rds") 
+
+runCorrelation(expr, scenicOptions)
+## get the adjacencies.csv
+
+scenicOptions <- readRDS("int/scenicOptions.Rds")
+# load file from pySCENIC results
+GRNBoost_linkList <- importArboreto(
+  "./cisTarget_databases/adjacencies_C1QNCM.csv")
+GRNBoost_linkList$V1<-NULL
+GRNBoost_linkList$weight<-GRNBoost_linkList$Importance
+GRNBoost_linkList$Importance<-NULL
+GRNBoost_linkList <- GRNBoost_linkList[order(GRNBoost_linkList[,"weight"], decreasing=TRUE),]
+saveRDS(GRNBoost_linkList, file=getIntName(scenicOptions, "genie3ll"))
+
+summary(GRNBoost_linkList$weight)
+scenicOptions@settings$modules$weightThreshold<-1
+runSCENIC_1_coexNetwork2modules(scenicOptions)
+runSCENIC_2_createRegulons(scenicOptions)
+
+logMat <- log2(expr+1)
+runSCENIC_3_scoreCells(scenicOptions, as.matrix(logMat))
+```
+
+
+```{r}
+
+regulonAUC_C1QNCM<- readRDS("./int/3.4_regulonAUC.Rds")
+regulonAUC_C1QNCM<- regulonAUC_C1QNCM[onlyNonDuplicatedExtended(rownames(regulonAUC_C1QNCM)),]
+
+regulonAUC<- regulonAUC_C1QNCM[onlyNonDuplicatedExtended(rownames(regulonAUC_C1QNCM)),]
+
+
+cellInfo<-readRDS("./int/cellinfo.Rds")
+cellInfo<-cellInfo[colnames(regulonAUC),]
+
+HC<-colnames(regulonAUC)[which(cellInfo$condition=='HC')]
+BD<-colnames(regulonAUC)[which(cellInfo$condition=='BD')]
+
+# get the significant TF
+p<-c()
+getAUC<-getAUC(regulonAUC)
+colnames(getAUC)<-colnames(regulonAUC)
+for(x in rownames(regulonAUC@assays@data@listData$AUC)){
+  C1QNCM_HC<-getAUC[x,HC]
+  
+  C1QNCM_BD<-getAUC[x,BD]
+  
+  C1QNCM_p<-t.test(C1QNCM_HC,C1QNCM_BD)
+  
+  p<-c(p,C1QNCM_p$p.value)
+}
+p_adjust<-fdr<-p.adjust(p,'BH')
+
+frame<-data.frame(regulon=rownames(regulonAUC@assays@data@listData$AUC),
+                  p.value=p,p_adjust=p_adjust
+)
+
+frame<-frame[order(frame$p_adjust),]
+
+
+# get regulon gene sets
+
+regulon_geneset<- readRDS("./int/2.6_regulons_asGeneSet.Rds")
+
+DEG<-read.table("./C1QNCM DEG.txt")
+DEG<-as.character(DEG$V1)
+DEGup<-read.table("./C1QNCM DEGup.txt")
+DEGup<-as.character(DEGup$V1)
+DEGdown<-read.table("./C1QNCM DEGdown.txt")
+DEGdown<-as.character(DEGdown$V1)
+
+a<-unlist(lapply(strsplit(as.character(frame$regulon[1:37]),split=' '),FUN = function(x){x[1]}))
+
+pos=c()
+for(i in a){
+  pos<-c( pos,which ((names(regulon_geneset))==i) )
+}
+
+regulonset<-regulon_geneset[pos]
+all_genes<-unique(c(unlist(regulonset),DEG))
+
+p_DEG<-c()
+p_up<-c()
+p_down<-c()
+regu<-c()
+for (x in 1:length(regulonset)){
+  regu<-c(regu,names(regulonset)[x])
+  k<-length(intersect(DEG,unlist(regulonset[x])))
+  n<-length(unlist(regulonset[x]))
+  N<-length(all_genes)
+  M<-length(DEG)
+  p1<-1-phyper(k-1,M,N-M,n);p_DEG<-c(p_DEG,p1)
+  M<-length(DEGup);k<-length(intersect(DEGup,unlist(regulonset[x])))
+  p2<-1-phyper(k-1,M,N-M,n);p_up<-c(p_up,p2)
+  M<-length(DEGdown);k<-length(intersect(DEGdown,unlist(regulonset[x])))
+  p3<-1-phyper(k-1,M,N-M,n);p_down<-c(p_down,p3)
+}
+
+enrich<-data.frame(regu,p_DEG,p_up,p_down)
+
+# decide select DEG
+num<-c()
+for (x in 1:length(regulonset)){
+  num<-c(num,length(intersect(DEG,unlist(regulonset[x]))))
+}
+enrich$DEGnum<-num
+
+enrich$log<--log(enrich$p_DEG)
+
+enrich<-enrich[order(enrich$DEGnum,decreasing=T),]
+
+enrich_new<-enrich[1:6,]
+
+# plot 
+lapply(c("STAT1","IRF1","ETV7",
+         "IRF7","STAT2","SPI1"), 
+       function(i){
+         ga=c()
+         for (x in DEG){
+           if ( x %in% regulonset[[i]]) {
+            ga<-c(ga,1)} else{
+            ga1<-c(ga1,0)}
+           }
+       })->ga.list
+
+
+
+result<-do.call(rbind,ga.list)
+
+result<-t(result)
+
+pheatmap::pheatmap(result,cluster_cols=F,cluster_rows=F,
+                   color = colorRampPalette(colors = c("white","darkred"))(2),
+                   border_color=NA)
+
+
+dataaa<-enrich[1:6,]
+dataaa$regu<-factor(dataaa$regu,levels = rev(dataaa$regu))
+ggplot(dataaa,aes(y=log,x=regu))+
+  geom_bar(stat="identity",colour="darkred",fill="darkred")+theme_pubr()+
+  theme(legend.position = "none")+
+  coord_flip()+
+  xlab("")+ylab("-logFDR")
+
+```
+
+
+
+
+
+# CellPhoneDB analysis 
+
+```{bash}
+# run BD and HC separately
+mkdir cpdb_res
+nohup cellphonedb method statistical_analysis meta.bd.txt mono_BD_count.txt --threads=8 --counts-data=gene_name &
+nohup cellphonedb method statistical_analysis meta.bd.txt mono_HC_count.txt --threads=8 --counts-data=gene_name &
+```
+
+## analyze cpdb result
+
+```{r}
+############################
+colHC<- rgb(60, 84, 136, 130, maxColorValue=255)
+colBD<- rgb(243, 155, 127, 160, maxColorValue=255)
+
+col_cluster<-c("#0073C2B2","#7876B1B2",
+               "#EFC000B2","#3B3B3BB2",
+               "#F39B7FB2","#4DBBD5B2","#EE4C97B2","#E64B35B2", #cd4
+               "#8F7700B2","#FFDC91B2","#E18727B2", "#6F99ADB2", # cd8
+               "#868686B2",
+               "#7AA6DCB2","#3C5488B2",#NK
+               "#91D1C2B2",'#00A087B2',"#20854EB2",#B cell
+               "#8491B4B2","#BC3C29B2","#f47942")
+cell.order = c('CD14+ Monocyte','CD16+ Monocyte',
+               "pDC","cDC",
+               "CD4 Tnaive" ,  "CD4 Tmemory" ,"CD4 T IFNrelated","CD4 Treg" ,     
+               "CD8 Tnaive","CD8 GMZK+T" ,"CD8 Teffector","Innate like T",
+               "Proliferating T",
+               "Activate NK","Resting NK", 
+               "Naive B","Memory B","Plasma B",
+               "Megakaryocyte","Erythrocyte","C1Q+Mono")
+grid.col = setNames(col_cluster,cell.order)
+```
+
+## circos plot
+
+```{r}
+# frequency of significant interaction pais  (summary file )
+
+cpdb.sum<- readxl::read_xlsx("../summary.xlsx",sheet = 2)
+
+cpdb.sum %>%
+  mutate(sum = hc+bd,
+         change = case_when(bd>hc~"up",
+                            bd<hc~"down",
+                            TRUE ~ "not"),
+         col = case_when(change =="up" ~colBD,
+                         change =="down" ~colHC,
+                         TRUE ~"grey90"
+         )) %>%
+  filter(!grepl("B",from) &
+           !grepl("B",to) )->data.plot
+chordDiagram(data.plot[,c(1,2,5)],  directional = 1, 
+             col = data.plot$col,grid.col = grid.col,
+             transparency = 0.7,
+             order = (cell.order),
+             big.gap = 10, small.gap = 1,
+             annotationTrack = c("name", "grid"),
+             direction.type = c("diffHeight", "arrows"),
+             link.arr.type = "big.arrow",
+             link.arr.length = 0.2)
+
+circos.clear()
+```
+
+## plot the specific interactions between T/NK and c1q mono
+
+```{r}
+################
+cp.bd<- fread("bd_out/significant_means.txt",data.table = F)
+cp.bd.sel=cp.bd[,grepl("C1Q",colnames(cp.bd))]
+rownames(cp.bd.sel)=cp.bd$interacting_pair
+cp.bd.sel %>%
+  rownames_to_column(var = "genepair") %>%
+  gather(-genepair,key = "cellpair",value="score") %>%
+  filter(!is.na(score)) %>%
+  mutate(id= paste0(genepair,"_",cellpair)) ->cp.sig.bd
+  
+cp.hc<- fread("hc_out/significant_means.txt",data.table = F)
+cp.hc.sel=cp.hc[,grepl("C1Q",colnames(cp.hc))]
+rownames(cp.hc.sel)=cp.hc$interacting_pair
+cp.hc.sel %>%
+  rownames_to_column(var = "genepair") %>%
+  gather(-genepair,key = "cellpair",value="score") %>%
+  filter(!is.na(score)) %>%
+  mutate(id= paste0(genepair,"_",cellpair)) ->cp.sig.hc
+
+merge(cp.sig.hc,cp.sig.bd,by="id",all=T) %>%
+  mutate(score_diff = log2(score.y/score.x)) %>%
+  dplyr::filter((score_diff)>.5) %>%
+  pull(genepair.y) %>%
+  unique()->sel.inter
+  
+cp.order=unique(cp.sig.hc$cellpair)
+merge(cp.sig.hc,cp.sig.bd[,c("id","score")],by="id",all=T) %>%
+  mutate(score_diff = log2(score.y/score.x)) %>%
+  filter(genepair%in% sel.inter) %>%
+  filter(cellpair!="C1Q+Mono|C1Q+Mono") %>%
+  mutate(cellpair = factor(cellpair,levels =cp.order[c(2,4:29,1)] )) %>%
+  ggscatter(y="cellpair",x="genepair",
+            size ="score_diff",
+            xlab = "",ylab = "",
+            color = "score_diff" )+
+  scale_color_distiller(palette = "RdYlBu",direction = -1)+
+  theme(legend.position = "right")+
+  rotate_x_text()->p
+ggsave(p, filename = "../../../Figures_BD/scRNAseq/cpdb.pdf",
+       height = 7,width = 6)  
+  
+```
+
+# identify c1q monocytes  in other diseases
+
+```{r}
+calAUC<- function(seu.obj,geneSets){
+  require(AUCell)
+  set.seed(123)
+  expr.mono<- seu.obj@assays$RNA@counts
+  cells_rankings <- AUCell_buildRankings(expr.mono)
+  cells_AUC <- AUCell_calcAUC(geneSets, 
+                              cells_rankings, 
+                              aucMaxRank=nrow(cells_rankings)*0.05)
+  cells_assignment <- AUCell_exploreThresholds(cells_AUC, 
+                                               plotHist=TRUE, 
+                                               nCores=1, assign=TRUE)
+  #auc.sel <- getAUC(cells_AUC)
+  #selectedThresholds <- getThresholdSelected(cells_assignment)
+  out= list(cells_AUC=cells_AUC,
+            cells_assignment=cells_assignment)
+  return(out)
+}
+
+calUMAP<- function(seu.obj,scale.var="orig.ident"){
+  seu.obj <- NormalizeData(seu.obj)
+  seu.obj <- FindVariableFeatures(seu.obj, 
+                                       selection.method = "vst", 
+                                       nfeatures = 2000)
+  seu.obj <- ScaleData(seu.obj, vars.to.regress =scale.var)
+  seu.obj <- RunPCA(seu.obj)
+  seu.obj <- FindNeighbors(seu.obj, dims = 1:25 )
+  seu.obj <- FindClusters(seu.obj, resolution = 0.4)
+  seu.obj <- RunUMAP(seu.obj, dims = 1:25)
+  umap.sel<-seu.obj@reductions$umap@cell.embeddings
+  return(umap.sel)
+}
+
+readh5<- function(h5_file){
+  library(Matrix)
+  library(rhdf5)
+  h5 <- h5read(h5_file, "matrix")
+  counts <- sparseMatrix(
+    dims = h5$shape,
+    i = as.numeric(h5$indices),
+    p = as.numeric(h5$indptr),
+    x = as.numeric(h5$data),
+    index1 = FALSE
+  )
+  colnames(counts) <- h5$barcodes
+  rownames(counts) <- as.data.frame(h5[["features"]])$id
+  return(counts)
+}
+
+```
+
+## select top 20 genes of c1q mono as the signature
+```{r}
+mono.marker<- readRDS("../conserved_marker_mono.rds")
+c1q.mono= mono.marker[mono.marker$cluster=="C1Q+Mono",]
+geneSets <- list(geneSet1=c1q.mono$gene[1:20])
+```
+
+
+## immune diseases
+
+```{r}
+#SLE 
+sle.list<- list()
+filename<- list.dirs("./GSE135779_RAW",recursive = F)
+for (i in filename) {
+  tmp<-Read10X(i)
+  tmp.obj<- CreateSeuratObject(counts = tmp, project =basename(i),
+                               min.cells = 5,min.features = 200 )
+  #remove cells with low quality
+  tmp.obj[["percent.mt"]]<- PercentageFeatureSet(tmp.obj,pattern="^MT")
+  
+  tmp.obj<- subset(tmp.obj, 
+                   subset= nFeature_RNA>200 & nFeature_RNA<4000 & 
+                     percent.mt<10 )
+  #normalization
+  tmp.obj <- NormalizeData(tmp.obj)
+  tmp.obj <- FindVariableFeatures(tmp.obj,selection.method = "vst")
+  sle.list[[basename(i)]]<- tmp.obj
+}
+
+sle.anchors<- FindIntegrationAnchors(sle.list,dims = 1:30)
+sle.comb <- IntegrateData(anchorset = sle.anchors, dims = 1:30)
+DefaultAssay(sle.comb)<- "integrated"
+saveRDS(sle.comb, file= "./sle.comb.rds")
+
+rm(sle.comb)
+sle.comb <- ScaleData(sle.comb)
+sle.comb <- RunPCA(sle.comb)
+sle.comb <- FindNeighbors(sle.comb, reduction='pca',dim=1:30)
+sle.comb <- FindClusters(sle.comb, resolution = 0.4)
+sle.comb <- RunUMAP(sle.comb, dims = 1:30)
+FeaturePlot(sle.comb,features = c("LYZ","CD14","FCGR3A"))
+DimPlot(sle.comb,label = T)
+sle.markers<- FindAllMarkers(sle.comb,only.pos = T,min.pct = 0.2,
+                            logfc.threshold = 0.2)
+write.csv(sle.markers,file = "./result/sle.markers.csv")
+
+sle.comb.mono = subset(sle.comb,seurat_clusters%in% c(0,6))
+saveRDS(sle.comb.mono, file = "./GSE135779_RAW/sle.comb.mono.rds")
+
+
+calAUC(sle.comb.mono,geneSets = geneSets)->sle.mono.out
+DefaultAssay(sle.comb.mono)="RNA"
+calUMAP(sle.comb.mono,scale.var = "orig.ident")->sle.mono.umap
+plotCell(sle.mono.out,umap=sle.mono.umap)->sle.data
+sle.data %>%
+  ggscatter(x="UMAP_1",y="UMAP_2",
+            palette = c("brown","grey90"),
+            color = "class")
+ggsave("../../Figures/scRNAseq/sle.umap.pdf",height = 4.5,width = 4.5)
+
+
+```
+
+
+
+```{r}
+#RA data
+options(stringsAsFactors = F)
+library(data.table)
+count.mat<- fread("/data/ldp02/xiaoman/BD/data/scRNAseq_dataset/RA/celseq_matrix_ru10_reads.tsv",
+                  drop = "gene",data.table = F)
+genename<-fread("/data/ldp02/xiaoman/BD/data/scRNAseq_dataset/RA/celseq_matrix_ru10_reads.tsv",
+                select  = "gene",data.table = F)
+
+rownames(count.mat)<-genename$gene
+count.mat.ra<- apply(count.mat, 1, 
+                  function(x){x[is.na(x)]<-0
+                  return(x)})
+
+library(Seurat)
+ra.meta <-fread("./scRNAseq_dataset/RA//celseq_meta.tsv.725591.gz")
+rownames(ra.meta)=ra.meta$cell_name
+ra.obj<- CreateSeuratObject(counts = t(count.mat.ra),
+                             project = "RA",meta.data =ra.meta )
+all(rownames(ra.obj@meta.data)==ra.meta$cell_name)
+
+
+ra.obj.mono<- subset(ra.obj,type=="Monocyte")
+ra.obj.mono<- subset(ra.obj.mono, percent_mt_molecules_ru1<.25  )
+ra.obj.mono<- subset(ra.obj.mono, genes_detected<5000 & genes_detected>10 )
+
+calAUC(ra.obj.mono,geneSets = geneSets)->ra.mono.out
+ra.mono.out$cells_assignment$geneSet1$aucThr$selected=setNames(0.4422109,"Global_k1")
+DefaultAssay(ra.comb.mono)="RNA"
+calUMAP(ra.obj.mono,scale.var = NULL)->ra.mono.umap
+plotCell(ra.mono.out,umap=ra.mono.umap)->ra.data
+ra.data %>%
+  ggscatter(x="UMAP_1",y="UMAP_2",
+            palette = c("brown","grey90"),
+            color = "class")
+ggsave("../../Figures_BD/scRNAseq/ra.umap.pdf",height = 4.5,width = 4.5)
+```
+
+
+
+## cancer data
+
+```{r}
+# cancer dataset from TISCH database
+library(rhdf5)
+#use rp value
+h5ls("./scRNAseq_dataset/CLL_GSE111014_expression.h5")
+
+ccl.data <- readh5("./CLL_GSE111014/CLL_GSE111014_expression.h5")
+ccl.meta<- fread("./CLL_GSE111014/CLL_GSE111014_CellMetainfo_table.tsv",data.table = F)
+rownames(ccl.meta)=ccl.meta$Cell
+
+ccl.obj<- CreateSeuratObject(counts = (ccl.data),
+                            project = "CLL",
+                            meta.data =ccl.meta )
+all(colnames(ccl.data)==ccl.meta$Cell)
+head(ccl.obj@meta.data)
+
+ccl.obj.mono<- subset(ccl.obj,Celltype..major.lineage.=="Mono/Macro")
+
+calAUC(ccl.obj.mono,geneSets = geneSets)->ccl.mono.out
+
+calUMAP(ccl.obj.mono,scale.var = NULL)->ccl.mono.umap
+plotCell(ccl.mono.out,umap=ccl.mono.umap)->ccl.data
+ccl.data %>%
+  ggscatter(x="UMAP_1",y="UMAP_2",
+            palette = c("grey90"),
+            color = "class")
+ggsave("../../Figures_BD/scRNAseq/ccl.umap.pdf",height = 4.5,width = 4.5)
+
+```
+
+
+
+```{r}
+# ALL data
+all.data <- readh5("./ALL_GSE132509/ALL_GSE132509_expression.h5")
+all.meta<- fread("./ALL_GSE132509/ALL_GSE132509_CellMetainfo_table.tsv",data.table = F)
+rownames(all.meta)=all.meta$Cell
+
+all.obj<- CreateSeuratObject(counts = (all.data),
+                             project = "ALL",
+                             meta.data =all.meta )
+all(colnames(all.data)==all.meta$Cell)
+head(all.obj@meta.data)
+
+all.obj.mono<- subset(all.obj,Celltype..major.lineage.=="Mono/Macro")
+calAUC(all.obj.mono,geneSets = geneSets)->all.mono.out
+
+calUMAP(all.obj.mono,scale.var = NULL)->all.mono.umap
+plotCell(all.mono.out,umap=all.mono.umap)->all.data
+all.data %>%
+  ggscatter(x="UMAP_1",y="UMAP_2",
+            palette = c("grey90"),
+            color = "class")
+ggsave("../../Figures_BD/scRNAseq/all.umap.pdf",height = 4.5,width = 4.5)
+
+```
+

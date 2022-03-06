@@ -1,0 +1,464 @@
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+setwd("/home/BD")
+options(stringsAsFactors = F)
+source("./code/sour_bd.R")
+```
+
+
+
+# Part1: integrate 10X data
+
+```{r}
+library(Seurat)
+library(tidyverse)
+library(ggpubr)
+
+setwd("./data/scRNA_seq_data/")
+BD_PBMC.list<- list()
+filename<- list.dirs("./",recursive = F)
+for (i in filename) {
+  tmp<-Read10X(i)
+  print("finish read10x")
+  tmp.obj<- CreateSeuratObject(counts = tmp, project =basename(i),
+                               min.cells = 5,min.features = 200 )
+  #remove cells with low quality
+  tmp.obj[["percent.mt"]]<- PercentageFeatureSet(tmp.obj,pattern="^MT")
+  
+  tmp.obj<- subset(tmp.obj, 
+                   subset= nFeature_RNA>200 & nFeature_RNA<4000 & 
+                     percent.mt<10 )
+  #normalization
+  tmp.obj <- NormalizeData(tmp.obj)
+  tmp.obj <- FindVariableFeatures(tmp.obj,selection.method = "vst")
+  BD_PBMC.list[[basename(i)]]<- tmp.obj
+}
+
+BD_PBMC.anchors<- FindIntegrationAnchors(BD_PBMC.list,dims = 1:30)
+BD_PBMC.comb <- IntegrateData(anchorset = BD_PBMC.anchors, dims = 1:30)
+DefaultAssay(BD_PBMC.comb)<- "integrated"
+
+BD_PBMC.bj <- RunPCA(BD_PBMC.bj)
+BD_PBMC.bj <- FindNeighbors(BD_PBMC.bj, dims = 1:20)
+BD_PBMC.bj <- FindClusters(BD_PBMC.bj, resolution = 0.9)
+BD_PBMC.bj <- RunUMAP(BD_PBMC.bj, dims = 1:20)
+BD_PBMC.bj.markers <- FindAllMarkers(BD_PBMC.bj, only.pos = TRUE, 
+                                     min.pct = 0.25, logfc.threshold = 0.2)
+saveRDS(BD_PBMC.bj, file= "./BD_PBMC.bj.rds")
+write.csv(BD_PBMC.bj.markers,
+          file = "./BD_PBMC.markers.csv")
+
+```
+
+## QC 
+
+```{r}
+tpmMat= BD_PBMC.bj@assays$RNA@counts
+  nGene = apply(tpmMat, 2, function(x) length(x[x>0]))
+  nCell = apply(tpmMat, 1, function(x) length(x[x>0]))
+as.data.frame(nGene) %>%
+  rownames_to_column(var = "cell") %>%
+  gghistogram(x='nGene',add = "median",fill = "lightgray",xlab = "Number of Genes Expressed",
+              add.params = list(color="brown",linetype = "dashed"))+
+  annotate("text", x = 2000, y = 6000, label = "Median: 1096")->p1
+
+as.data.frame(nCell) %>%
+  rownames_to_column(var = "cell") %>%
+  gghistogram(x='nCell',add = "median",fill = "lightgray",xlab = "Number of Cells Expressed",bins = 50,
+              add.params = list(color="brown",linetype = "dashed"))+
+  annotate("text", x = 5000, y = 4000, label = "Median: 601")->p2
+
+library(cowplot)
+ggsave(plot_grid(p1,p2), filename = "./fig s1/QC_cell_gene.pdf",height = 3.5, width = 8)  
+  
+FeatureScatter(BD_PBMC.bj,
+               feature1 = "nCount_RNA",feature2 = "percent.mt",cols = rep("grey",20)) +
+  NoLegend()+labs(x="Gene count",y="Mitochondiral fraction",title = "")->p
+ggsave(p, filename = "./fig s1/QC_mito_gene.pdf",height = 3.5, width = 4)  
+
+```
+
+# Part 2: annotation
+
+## 2.1 singleR annotation
+
+```{r}
+library(SingleR)
+options(stringsAsFactors = F)
+singler = CreateSinglerObject(counts = BD_PBMC.bj@assays$RNA@counts, 
+                              project.name = 'BM_PBMC', min.genes = 200,
+                              technology = "10X", species = "Human", citation = "",
+                              normalize.gene.length = F, variable.genes = "de",
+                              fine.tune = T, do.signatures = T, 
+                              clusters = NULL, 
+                              do.main.types = T, 
+                              reduce.file.size = T, numCores = 20)
+
+singler$seurat = BD_PBMC.bj # (optional)
+rownames(singler)
+singler$meta.data$orig.ident = BD_PBMC.bj@meta.data$orig.ident 
+singler$meta.data$xy = BD_PBMC.bj@reductions$umap@cell.embeddings # the tSNE coordinates
+singler$meta.data$clusters = BD_PBMC.bj$seurat_clusters 
+# the Seurat ## Note the use of the second iterm in the the singler$singler list to use 
+# the Blueprint+ENCODE reference. The first item is HPCA.
+# use singler$singler[[i]]$about for meta-data on the reference.
+out = SingleR.PlotTsne(singler$singler[[1]]$SingleR.single,
+                       singler$meta.data$xy,do.label = T,
+                       do.letters = T,
+                       #labels = singler$seurat@active.ident, 
+                       dot.size = 1.3,alpha=0.5,label.size = 3)
+
+```
+
+## 2.2 Final annotation
+
+```{r}
+
+current.cluster.ids = as.integer(levels(BD_PBMC.bj$integrated_snn_res.0.5))
+
+new.cluster.ids = c('CD4 Tmemory','CD4 Tnaive',
+                    'CD14+ Monocyte','Naive B',
+                    'Innate like T','CD8 Teffector',
+                    'Activate NK','CD8 Tnaive','Memory B',
+                    'Activate NK','CD8 GMZK+T',
+                    'Megakaryocyte','CD4 Treg',
+                    'CD16+ Monocyte','cDC',
+                    'Erythrocyte','Resting NK',
+                    'Proliferating T','pDC',
+                    'CD4 T IFNrelated','Plasma B')
+
+
+BD_PBMC.bj@meta.data$sum.ident = plyr::mapvalues(
+  x = BD_PBMC.bj$integrated_snn_res.0.5,
+                                                 from = current.cluster.ids, 
+  to = new.cluster.ids)
+Idents(BD_PBMC.bj)  ="sum.ident"
+
+cell.order = c(grep("CD4",new.cluster.ids,value = T),
+               grep("CD8",new.cluster.ids,value = T),
+               grep("Monocyte",new.cluster.ids,value = T),
+               grep("Bcell",new.cluster.ids,value = T),"Plasma cells",
+               grep("NK",new.cluster.ids,value = T),"DC",
+               "CMP","Proliferating Tcell", "Megakaryocytes")
+BD_PBMC.bj$sum.ident<-factor(BD_PBMC.bj$sum.ident,levels = cell.order)
+
+```
+
+# Figure 1
+
+```{r}
+#sel color
+
+colHC<- rgb(60, 84, 136, 130, maxColorValue=255)
+colBD<- rgb(243, 155, 127, 160, maxColorValue=255)
+col_patient<-c(RColorBrewer::brewer.pal(8,"Set3")) # colors for 8 patients
+
+col_cluster<-c("#0073C2B2","#7876B1B2",
+               "#EFC000B2","#3B3B3BB2",
+               "#F39B7FB2","#4DBBD5B2","#EE4C97B2","#E64B35B2", #cd4
+               "#8F7700B2","#FFDC91B2","#E18727B2", "#6F99ADB2", # cd8
+               "#868686B2",
+               "#7AA6DCB2","#3C5488B2",#NK
+               "#91D1C2B2",'#00A087B2',"#20854EB2",#B cell
+               "#8491B4B2","#BC3C29B2")
+```
+
+
+```{r}
+as.data.frame(BD_PBMC.bj@meta.data) %>%
+  dplyr::mutate(sum.ident=factor(sum.ident,levels = cell.order)) %>%
+  group_by(patient) %>%
+  summarise(n=n()) ->pat.cell
+  # 
+
+as.data.frame(BD_PBMC.bj@meta.data) %>%
+  group_by(sum.ident,condition,patient) %>%
+  summarise(cls_n=n()) %>%
+  inner_join(pat.cell,by=c("patient"="patient")) %>%
+  dplyr::mutate(ratio = cls_n/n) %>% 
+  ggboxplot(x="sum.ident",y="ratio",
+            color  = "condition",add = "jitter")+
+  facet_wrap(~sum.ident,scales = "free")+
+  stat_compare_means(aes(group=condition),label = "p.format")->p4
+
+ggsave(p4, filename = "./Figures//ratio_cls_comp.pdf",height = 4.5,width = 6)
+
+```
+
+```{r}
+Idents(BD_PBMC.bj)="seurat_clusters"
+celltype_expr<-log1p(AverageExpression(BD_PBMC.bj, verbose = FALSE)$RNA)
+celltype_expr<-AverageExpression(BD_PBMC.bj)
+celltype_expr<- as.data.frame(celltype_expr)
+celltype_expr.cor<- cor(celltype_expr,method = "spearman")
+colnames(celltype_expr.cor)=str_remove_all(pattern = "integrated.",
+                                           string = colnames(celltype_expr.cor))
+rownames(celltype_expr.cor)=colnames(celltype_expr.cor)
+
+library(pheatmap)
+
+annot_col = BD_PBMC.bj@meta.data[,c("seurat_clusters","sum.ident")] %>%
+  unique()
+
+rownames(annot_col)=annot_col$seurat_clusters
+library(RColorBrewer)
+pheatmap(celltype_expr.cor,
+         annotation_row = annot_col[,"sum.ident",drop=F],
+         color = colorRampPalette(rev(brewer.pal(n = 7, name ="RdBu")))(100))
+
+generate.PDF(plot = pheatmap(celltype_expr.cor,
+                             annotation_row = annot_col[,"celltype",drop=F],
+                             color = colorRampPalette(rev(brewer.pal(n = 7, name =
+  "RdBu")))(100)),width = 8,height = 6,
+             file = "./Figures/cor.expr.pdf")
+```
+
+```{r}
+FeaturePlot(BD_PBMC.bj,features =c("CD3D","CD8A","CD79A","KLRF1","CD33","PPBP"),
+            ncol=3, cols =c("grey",brewer.pal(9,"YlOrRd"))  )->p
+ggsave(p,filename = "./Figures/pbmc_markers.pdf",
+       height = 7,width = 12 )
+```
+
+# Figure 2
+
+```{r}
+
+
+ciber.bulk<- read.csv("CIBERSORT.Output_tpm.csv",row.names = 1)
+ciber.bulk.filter<- ciber.bulk[,colSums(ciber.bulk)>.01]
+ciber.bulk.filter=ciber.bulk.filter[,1:10]
+rownames(ciber.bulk.filter)=str_remove_all(rownames(ciber.bulk.filter),pattern = "_tpm")
+
+cell.order = c("Monocytes","T.cells.CD4.naive",
+               "T.cells.CD4.memory",
+               "T.cells.regulatory..Tregs.","T.cells.CD8" ,
+               "NK.cells",
+               "B.cells.naive","B.cells.memory")
+ciber.bulk.filter %>%
+  rownames_to_column(var = 'sample') %>%
+  mutate(condition = substr(sample, 1,2),
+         condition=factor(condition,levels = c("HC","BD"))) %>%
+  mutate(NK.cells = NK.cells.resting+NK.cells.activated,
+         T.cells.CD4.memory = T.cells.CD4.memory.resting+T.cells.CD4.memory.activated) %>%
+  dplyr::select(-9,-10,-6,-7) %>%
+  gather(-sample,-condition,key = "celltype",value = "ratio") %>%
+  mutate(celltype= case_when(grepl("B.cells.naive",celltype)~"Naive B",
+                             grepl("B.cells.memory",celltype)~"Memory B",
+                             grepl("Plasma.cells",celltype)~"Plasma B",
+                             grepl("T.cells.CD4.naive",celltype)~"CD4 Tnaive",
+                             
+                             grepl("T.cells.CD4.memory",celltype)~"CD4 Tmemory",
+                             grepl("T.cells.CD8",celltype)~"CD8 T",
+                             grepl("T.cells.regulatory..Tregs.",celltype)~"Treg",
+                             
+                             grepl("NK.cells",celltype)~"NK cells",
+                             TRUE ~ celltype)) %>% 
+  mutate(celltype=factor(celltype,
+                         levels = c("Monocytes","NK cells","Activate NK",
+                                    "Memory B","Naive B","Plasma B",
+                                    "CD4 Tnaive","CD4 Tmemory","Treg","CD8 T")))%>%
+  ggboxplot(x="celltype",y="ratio",add = "jitter",
+            fill = "condition",color= "condition",
+            ylab = "Cell proportion",
+            palette = c(colHC,colBD))+
+  stat_compare_means(aes(group=condition),label = "p.signif")+
+  rotate_x_text()+rremove("xlab")->p
+
+ggsave(p, height = 4.5,width = 6,
+       filename = "./Figures_BD/cell_prop_boxplot.pdf") 
+
+# adjust age info in lmer 
+clinical_info_bulk= read_excel("./TableS1.xlsx")
+loc= grepl(clinical_info_bulk$experiment,pattern =  "bulk-RNAseq")
+bulk.info = clinical_info_bulk[loc,]
+merge(data.plot,bulk.info[,1:5],by=1) ->lmer.data
+library(lme4)
+library(lmerTest)
+lmer.res=list()
+for (celltype in unique(lmer.data$celltype)) {
+  tmp=lmer(ratio~condition+(1|age),
+     lmer.data[lmer.data$celltype==celltype,])
+   summary(tmp)->tmp2
+  lmer.res[[celltype]] = tmp2$coefficients[2,]
+}
+lmer.res.data = do.call(rbind,lmer.res)
+# monocyte :0.0299 *
+
+```
+
+```{r}
+# check the degene in the bulk rnaseq data
+bulk.count<- fread("./data/expr.count.company.expression.txt",data.table = F)
+
+bulk.count <- column_to_rownames(bulk.count,var = "gene_name")
+
+library(DESeq2)
+coldata = data.frame(sample = colnames(bulk.count),
+                     condition = substr(colnames(bulk.count),1,2),
+                     subtype = c(rep(c("HC","BDU","BDV"),c(10,3,6)))
+                     )
+rownames(coldata)=coldata$sample
+
+dds <- DESeqDataSetFromMatrix(countData = bulk.count,
+                              colData = coldata,
+                              design= ~ condition)
+keep <- rowSums(counts(dds)) >= 20
+dds <- dds[keep,]
+dds$condition <- factor(dds$condition, levels = c("HC","BD"))
+dds <- DESeq(dds)
+resultsNames(dds) 
+res <- results(dds,name="condition_BD_vs_HC",
+               alpha=0.05,lfcThreshold=1)
+resLFC <- lfcShrink(dds, coef="condition_BD_vs_HC", type="apeglm")
+saveRDS(resLFC, file = "./result/resLFC.rds")
+resLFC_data<- as.data.frame(resLFC)
+resLFC_data_filtered<- resLFC_data[resLFC_data$padj<.05&abs(resLFC_data$log2FoldChange)>1,]
+
+vsd <- vst(dds, blind=FALSE)
+p<- plotPCA(vsd)+scale_color_manual(values = c(colHC,colBD))+theme_pubr()+rremove("legend.title")
+ggsave(plot = p, filename = "./Figures/bulk_pca.pdf",
+       height =4,width = 4.5 )
+
+
+# load gene expr from scrnaseq 
+Idents(BD_PBMC.bj)="seurat_clusters"
+DefaultAssay(BD_PBMC.bj)="integrated"
+celltype_expr<-log1p(AverageExpression(BD_PBMC.bj, verbose = FALSE)$RNA)
+celltype_expr<-AverageExpression(BD_PBMC.bj)
+celltype_expr<- as.data.frame(celltype_expr)
+celltype_expr_integrated =celltype_expr$integrated
+
+#Figure 2b-c
+up.gene = rownames(resLFC_data_filtered[resLFC_data_filtered$log2FoldChange>0,])
+down.gene = rownames(resLFC_data_filtered[resLFC_data_filtered$log2FoldChange<0,])
+merged.data.up <- celltype_expr_integrated[rownames(celltype_expr_integrated) %in% up.gene,]
+pheatmap(merged.data.up,scale = "row",color = rev(col2(50)))
+generate.PDF(plot = pheatmap(merged.data.up,scale = "row",border_color=F,
+                             cluster_cols = F,show_rownames = F,
+                             color = rev(col2(50))),
+             filename = "../loading_data/Figures_BD/up_bulk_scRNAseq.pdf",
+             working_path = "./",
+             height = 6,width = 7)
+
+merged.data.down <- celltype_expr_integrated[rownames(celltype_expr_integrated) %in% down.gene,]
+pheatmap(merged.data.down,scale = "row",color = rev(col2(50)))
+generate.PDF(plot = pheatmap(merged.data.down,scale = "row",border_color=F,
+                             cluster_cols = F,show_rownames = F,
+                             color = rev(col2(50))),
+             filename = "../loading_data/Figures_BD/down_bulk_scRNAseq.pdf",
+             working_path = "./",
+             height = 3,width = 7)
+
+#Figure 2a
+resLFC_data %>%
+  rownames_to_column(var = "gene") %>%
+  mutate(Threshold = case_when(log2FoldChange>1 & padj<0.05~"Up",
+                               log2FoldChange<(-1)& padj<0.05~"Down",
+                               TRUE ~ "not")) %>%
+  mutate(Padj= -log10(padj))-> tmp.plot
+
+library(ggpubr)
+ plotVolcano(tmp.plot, x = "log2FoldChange",y="Padj",plotLab=F,
+             fill ="Threshold",color = "Threshold" ,title = "")->p
+
+ggsave(p , filename = "../loading_data/Figures_BD/bulk_volcano.pdf",
+       height = 4.5,width = 7)
+```
+
+#DEGs of monocyte in PBMC scRNAseq 
+
+```{r}
+mono.bj.pbmc= subset(BD_PBMC.bj,
+                     sum.ident %in% c("CD14+ Monocyte","CD16+ Monocyte"))
+DefaultAssay(mono.bj.pbmc)="RNA"
+
+degene.mono.all<-FindMarkers(mono.bj.pbmc, min.pct = .01,
+                         logfc.threshold = 0.01,
+                   ident.1 = "BD", 
+                   ident.2 = "HC", 
+                   group.by = "condition",
+                   print.bar = T)
+saveRDS(degene.mono.all,"./result/degene.mono.all.rds")
+mkk.mono <- enrichDEgene(genelist_input =  rownames(degene.mono[degene.mono$avg_log2FC>0 & degene.mono$p_val<.05 ,]),
+                         method = "GO",
+                         species = c("Homo sapiens"),direction = "Up"
+                    )
+
+
+mkk.mono.down <- enrichDEgene(genelist_input =  rownames(degene.mono[degene.mono$avg_logFC<0,]),
+                         method = "GO",
+                         species = c("Homo sapiens"),direction = "Down"
+                    )
+
+# plot the volcano aand mark the IFN genes 
+sel_path = head(mkk.mono,n=8)[c(1,5,6),] %>%
+  as.data.frame() %>%
+  pull(geneID)
+sel_path %>%
+  str_split(pattern = "\\/") %>%
+  unlist() %>% unique() ->uniq.gene
+
+
+degene.mono.all %>%
+  rownames_to_column(var = 'gene') %>% 
+  mutate(log_padj = (-log10(p_val)),
+         Threshold= case_when(avg_logFC>.15&log_padj>2~"Up",
+                               TRUE~"Others"),
+         Threshold =  factor(Threshold, levels = c("Up","Others")))%>%
+ggscatter(x="pct.2",y="pct.1",color = "Threshold",
+          xlab = "Percentage of detected cells in HC",ylab = "Percentage of detected cells in BD",
+          label = "gene",palette = c("#FB8072","grey"),
+          label.select =uniq.gene ,repel =T) ->p
+
+ggsave(p, filename = "./Figures/degene_bd_mono.pdf",height = 5,width = 6.5)
+
+# plot the enriched pathways
+
+head(mkk.mono,n=8) %>%
+  mutate(padj= -log10(p.adjust)) %>%
+  ggbarplot(x="Description",y="padj",ylab = "-log10(P.adj)",
+            sort.val = "asc",fill = "padj")+rotate()+
+  scale_fill_distiller(palette = "OrRd",
+                       direction = 1)+rremove("ylab")+labs(fill="-log10(P.adj)")->p
+
+ggsave(p, filename = "./Figures/mono_depathway.pdf",height = 4.5,width = 12)
+
+```
+
+# plot stacked violin plot 
+
+```{r}
+BD_PBMC.bj = readRDS("../BD_project/input/BD_PBMC_integrated.rds")
+
+### parameter ####
+scPBMC_marker = c("LYZ","CD14","FCGR3A",
+                  "LILRA4","CLEC4C","CD1C","CLEC10A",
+                  "CD3D","CD8A","KLRF1","GZMK","GZMB",
+                  "CD79A","IL4R","CD27","MZB1",
+                  "PPBP","HBA1")
+
+### visualization ###
+col_cluster<-c("#0073C2B2","#7876B1B2",
+               "#EFC000B2","#3B3B3BB2",
+               "#F39B7FB2","#4DBBD5B2","#EE4C97B2","#E64B35B2", #cd4
+               "#8F7700B2","#FFDC91B2","#E18727B2", "#6F99ADB2", # cd8
+               "#868686B2",
+               "#7AA6DCB2","#3C5488B2",#NK
+               "#91D1C2B2",'#00A087B2',"#20854EB2",#B cell
+               "#8491B4B2","#BC3C29B2")
+new.cluster.ids = levels(BD_PBMC.bj$sum.ident)
+setNames(col_cluster,new.cluster.ids)->col_cluster
+Idents(BD_PBMC.bj)="sum.ident"
+StackedVlnPlot(BD_PBMC.bj,features = scPBMC_marker,
+               col_cluster = col_cluster)->p
+ggsave(p, height = 15,width = 9,
+       filename = "./Figures/StackedVlnPlot1.pdf")
+
+
+```
+
+
+
+
